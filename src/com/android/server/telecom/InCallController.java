@@ -629,7 +629,9 @@ public final class InCallController extends CallsManagerListenerBase {
         mTimeoutsAdapter = timeoutsAdapter;
 
         Resources resources = mContext.getResources();
-        mSystemInCallComponentName = TelephonyUtil.getInCallComponentName(context);
+        mSystemInCallComponentName = new ComponentName(
+                resources.getString(R.string.ui_default_package),
+                resources.getString(R.string.incall_default_class));
 
         mSystemStateProvider.addListener(mSystemStateListener);
     }

@@ -1481,7 +1481,7 @@ public class PhoneAccountRegistrar {
                         int outerDepth = parser.getDepth();
                         PhoneAccountHandle accountHandle = null;
                         String userSerialNumberString = null;
-                        String groupId = "";
+                        String groupId = null;
                         while (XmlUtils.nextElementWithin(parser, outerDepth)) {
                             if (parser.getName().equals(ACCOUNT_HANDLE)) {
                                 parser.nextTag();
@@ -1507,8 +1507,8 @@ public class PhoneAccountRegistrar {
                             }
                         }
                         if (accountHandle != null && userHandle != null) {
-                            return new DefaultPhoneAccountHandle(userHandle, accountHandle
-                                    , (groupId != null) ? groupId : "");
+                            return new DefaultPhoneAccountHandle(userHandle, accountHandle,
+                                    groupId != null ? groupId : "");
                         }
                     }
                     return null;
