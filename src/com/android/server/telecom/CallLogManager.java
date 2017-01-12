@@ -126,6 +126,10 @@ public final class CallLogManager extends CallsManagerListenerBase {
     private Object mLock;
     private String mCurrentCountryIso;
 
+    private static final int INCOMING_IMS_TYPE = 8;
+    private static final int OUTGOING_IMS_TYPE = 9;
+    private static final int MISSED_IMS_TYPE = 10;
+
     public CallLogManager(Context context, PhoneAccountRegistrar phoneAccountRegistrar,
             MissedCallNotifier missedCallNotifier) {
         mContext = context;
@@ -473,35 +477,20 @@ public final class CallLogManager extends CallsManagerListenerBase {
     private int toPreciseLogType(Call call, int callLogType) {
         final boolean isHighDefAudioCall =
                (call != null) && call.hasProperty(Connection.PROPERTY_HIGH_DEF_AUDIO);
-        final boolean isWifiCall =
-               (call != null) && call.hasProperty(Connection.PROPERTY_WIFI);
         Log.d(TAG, "callProperties: " + call.getConnectionProperties()
-                + "isHighDefAudioCall: " + isHighDefAudioCall
-                + "isWifiCall: " + isWifiCall);
-        if(!isHighDefAudioCall && !isWifiCall) {
+                + "isHighDefAudioCall: " + isHighDefAudioCall);
+        if(!isHighDefAudioCall) {
             return callLogType;
         }
         switch (callLogType) {
             case Calls.INCOMING_TYPE :
-                if(isWifiCall) {
-                    callLogType = Calls.INCOMING_WIFI_TYPE;
-                } else {
-                    callLogType = Calls.INCOMING_IMS_TYPE;
-                }
+                callLogType = INCOMING_IMS_TYPE;
                 break;
             case Calls.OUTGOING_TYPE :
-                if(isWifiCall) {
-                    callLogType = Calls.OUTGOING_WIFI_TYPE;
-                } else {
-                    callLogType = Calls.OUTGOING_IMS_TYPE;
-                }
+                callLogType = OUTGOING_IMS_TYPE;
                 break;
             case Calls.MISSED_TYPE :
-                if(isWifiCall) {
-                    callLogType = Calls.MISSED_WIFI_TYPE;
-                } else {
-                    callLogType = Calls.MISSED_IMS_TYPE;
-                }
+                callLogType = MISSED_IMS_TYPE;
                 break;
             default:
                 //Normal cs call, no change
