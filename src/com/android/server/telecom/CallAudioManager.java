@@ -379,6 +379,10 @@ public class CallAudioManager extends CallsManagerListenerBase {
         return null;
     }
 
+    public boolean hasAnyCalls() {
+        return mCallsManager.hasAnyCalls();
+    }
+
     void toggleMute() {
         mCallAudioRouteStateMachine.sendMessageWithSessionInfo(
                 CallAudioRouteStateMachine.TOGGLE_MUTE);
