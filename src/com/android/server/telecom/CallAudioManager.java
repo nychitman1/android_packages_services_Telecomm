@@ -251,7 +251,7 @@ public class CallAudioManager extends CallsManagerListenerBase {
         boolean isUpgradeRequest = !VideoProfile.isReceptionEnabled(previousVideoState) &&
                 VideoProfile.isReceptionEnabled(newVideoState);
 
-        if (isUpgradeRequest) {
+        if (call.getState() != CallState.DIALING && isUpgradeRequest) {
             mPlayerFactory.createPlayer(InCallTonePlayer.TONE_VIDEO_UPGRADE).startTone();
         }
     }
