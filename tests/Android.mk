@@ -22,6 +22,7 @@ LOCAL_STATIC_JAVA_LIBRARIES := \
         android-support-v4 \
         guava \
         mockito-target \
+        ims-ext-common \
         platform-test-annotations
 
 LOCAL_SRC_FILES := \
@@ -33,13 +34,19 @@ LOCAL_PROTOC_OPTIMIZE_TYPE := nano
 LOCAL_PROTOC_FLAGS := --proto_path=$(LOCAL_PATH)/../proto/
 LOCAL_PROTO_JAVA_OUTPUT_PARAMS := optional_field_style=accessors
 
+LOCAL_SRC_FILES += \
+        src/org/codeaurora/btmultisim/IBluetoothDsdaService.aidl
+
+
 LOCAL_RESOURCE_DIR := \
     $(LOCAL_PATH)/res \
     $(LOCAL_PATH)/../res
 
 LOCAL_JAVA_LIBRARIES := \
         android.test.runner \
-        telephony-common
+        telephony-common \
+        telephony-ext \
+        ims-common
 
 LOCAL_AAPT_FLAGS := \
     --auto-add-overlay \

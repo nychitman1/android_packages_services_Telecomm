@@ -100,6 +100,7 @@ public class CallAudioRouteStateMachine extends StateMachine {
     public static final int USER_SWITCH_BASELINE_ROUTE = 1105;
 
     public static final int UPDATE_SYSTEM_AUDIO_ROUTE = 1201;
+    public static final int SET_FALLBACK_AUDIO_ROUTE_HINT = 1202;
 
     public static final int MUTE_ON = 3001;
     public static final int MUTE_OFF = 3002;
@@ -121,6 +122,8 @@ public class CallAudioRouteStateMachine extends StateMachine {
         put(CallAudioState.ROUTE_SPEAKER, Log.Events.AUDIO_ROUTE_SPEAKER);
         put(CallAudioState.ROUTE_WIRED_HEADSET, Log.Events.AUDIO_ROUTE_HEADSET);
     }};
+
+    private static final int INVALID_AUDIO_FALLBACK_HINT = -1;
 
     private static final SparseArray<String> MESSAGE_CODE_TO_NAME = new SparseArray<String>() {{
         put(CONNECT_WIRED_HEADSET, "CONNECT_WIRED_HEADSET");
@@ -235,6 +238,9 @@ public class CallAudioRouteStateMachine extends StateMachine {
         public void exit() {
             Log.event(mCallsManager.getForegroundCall(), Log.Events.AUDIO_ROUTE,
                     "Leaving state " + getName());
+
+            // Reset fallback audio hint on exiting a state
+            mAudioRouteFallbackHint = INVALID_AUDIO_FALLBACK_HINT;
             super.exit();
         }
 
@@ -277,6 +283,9 @@ public class CallAudioRouteStateMachine extends StateMachine {
                 case SWITCH_FOCUS:
                     mAudioFocusType = msg.arg1;
                     return NOT_HANDLED;
+                case SET_FALLBACK_AUDIO_ROUTE_HINT:
+                    mAudioRouteFallbackHint = msg.arg1;
+                    return HANDLED;
                 default:
                     return NOT_HANDLED;
             }
@@ -647,11 +656,7 @@ public class CallAudioRouteStateMachine extends StateMachine {
                     // No change in audio route required
                     return HANDLED;
                 case DISCONNECT_WIRED_HEADSET:
-                    if (mWasOnSpeaker) {
-                        sendInternalMessage(SWITCH_SPEAKER);
-                    } else {
-                        sendInternalMessage(SWITCH_BASELINE_ROUTE);
-                    }
+                    sendInternalMessage(SWITCH_BASELINE_ROUTE);
                     return HANDLED;
                 case BT_AUDIO_DISCONNECT:
                     // This may be sent as a confirmation by the BT stack after switch off BT.
@@ -682,7 +687,10 @@ public class CallAudioRouteStateMachine extends StateMachine {
         @Override
         public void enter() {
             super.enter();
-            setSpeakerphoneOn(false);
+            // Don't close speaker to avoid Audio selects headset
+            // for a breif time with priority
+            // Need hide the speaker icon
+            mStatusBarNotifier.notifySpeakerphone(false);
             setBluetoothOn(true);
             CallAudioState newState = new CallAudioState(mIsMuted, ROUTE_BLUETOOTH,
                     mAvailableRoutes);
@@ -915,8 +923,11 @@ public class CallAudioRouteStateMachine extends StateMachine {
                     // in the bluetooth route.
                     return HANDLED;
                 case DISCONNECT_BLUETOOTH:
-                    sendInternalMessage(SWITCH_BASELINE_ROUTE);
                     mWasOnSpeaker = false;
+                    // Reset fallback audio hint on disconnecting BT as we should fallback to
+                    // EARPIECE.
+                    mAudioRouteFallbackHint = INVALID_AUDIO_FALLBACK_HINT;
+                    sendInternalMessage(SWITCH_BASELINE_ROUTE);
                     return HANDLED;
                 case DISCONNECT_WIRED_HEADSET:
                     updateSystemAudioState();
@@ -1148,6 +1159,12 @@ public class CallAudioRouteStateMachine extends StateMachine {
     private boolean mIsMuted;
     private boolean mAreNotificationSuppressed = false;
 
+    /**
+     * Hint to the state machine that the fallback audio route may have changed.
+     * It's up to the state machine to honor or ignore the hint.
+     */
+    private int mAudioRouteFallbackHint = INVALID_AUDIO_FALLBACK_HINT;
+
     private final Context mContext;
     private final CallsManager mCallsManager;
     private final AudioManager mAudioManager;
@@ -1363,6 +1380,8 @@ public class CallAudioRouteStateMachine extends StateMachine {
             mAudioManager.setSpeakerphoneOn(on);
             mStatusBarNotifier.notifySpeakerphone(on);
         }
+        // StatusBarNotifier has check for previous state before notifying again
+        mStatusBarNotifier.notifySpeakerphone(on);
     }
 
     private void setBluetoothOn(boolean on) {
@@ -1543,7 +1562,34 @@ public class CallAudioRouteStateMachine extends StateMachine {
         return true;
     }
 
+    private boolean isFallbackAudioHintValid() {
+        return (mAudioRouteFallbackHint != INVALID_AUDIO_FALLBACK_HINT);
+    }
+
+    private int getBaselineFallbackRoute(int audioRouteFallbackHint) {
+        switch (audioRouteFallbackHint) {
+            case ROUTE_EARPIECE:
+                return SWITCH_EARPIECE;
+            case ROUTE_SPEAKER:
+                return SWITCH_SPEAKER;
+            case ROUTE_WIRED_HEADSET:
+                return SWITCH_HEADSET;
+            case ROUTE_BLUETOOTH:
+                return SWITCH_BLUETOOTH;
+            default:
+                return SWITCH_EARPIECE;
+        }
+    }
+
     private int calculateBaselineRouteMessage(boolean isExplicitUserRequest) {
+        if (!isExplicitUserRequest) {
+            if (isFallbackAudioHintValid()) {
+                return getBaselineFallbackRoute(mAudioRouteFallbackHint);
+            } else if (mWasOnSpeaker) {
+                return SWITCH_SPEAKER;
+            }
+        }
+
         if ((mAvailableRoutes & ROUTE_EARPIECE) != 0) {
             return isExplicitUserRequest ? USER_SWITCH_EARPIECE : SWITCH_EARPIECE;
         } else if ((mAvailableRoutes & ROUTE_WIRED_HEADSET) != 0) {

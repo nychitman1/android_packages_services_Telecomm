@@ -49,7 +49,9 @@ import com.android.server.telecom.ProximitySensorManager;
 import com.android.server.telecom.TelecomSystem;
 import com.android.server.telecom.TelecomWakeLock;
 import com.android.server.telecom.Timeouts;
+import com.android.server.telecom.ViceNotifier;
 import com.android.server.telecom.ui.MissedCallNotifierImpl;
+import com.android.server.telecom.ui.ViceNotificationImpl;
 
 /**
  * Implementation of the ITelecom interface.
@@ -159,6 +161,14 @@ public class TelecomService extends Service implements TelecomSystem.Component {
                             },
                             new Timeouts.Adapter(),
                             new AsyncRingtonePlayer(),
+                            new ViceNotifier() {
+                                @Override
+                                public ViceNotificationImpl create(Context context,
+                                        CallsManager callsManager) {
+                                    return new ViceNotificationImpl(
+                                            context.getApplicationContext(), callsManager);
+                                }
+                            },
                             new PhoneNumberUtilsAdapterImpl(),
                             new InterruptionFilterProxy() {
                                 @Override

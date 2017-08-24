@@ -23,6 +23,7 @@ import com.android.server.telecom.ui.MissedCallNotifierImpl.MissedCallNotifierIm
 import com.android.server.telecom.BluetoothPhoneServiceImpl.BluetoothPhoneServiceImplFactory;
 import com.android.server.telecom.CallAudioManager.AudioServiceFactory;
 import com.android.server.telecom.TelecomServiceImpl.DefaultDialerManagerAdapter;
+import com.android.server.telecom.ui.ViceNotificationImpl;
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
@@ -101,6 +102,7 @@ public final class TelecomSystem {
     private final TelecomServiceImpl mTelecomServiceImpl;
     private final ContactsAsyncHelper mContactsAsyncHelper;
     private final DialerCodeReceiver mDialerCodeReceiver;
+    private final ViceNotifier mViceNotifier;
 
     private final BroadcastReceiver mUserSwitchedReceiver = new BroadcastReceiver() {
         @Override
@@ -155,6 +157,7 @@ public final class TelecomSystem {
                     bluetoothPhoneServiceImplFactory,
             Timeouts.Adapter timeoutsAdapter,
             AsyncRingtonePlayer asyncRingtonePlayer,
+            ViceNotifier vicenotifier,
             PhoneNumberUtilsAdapter phoneNumberUtilsAdapter,
             InterruptionFilterProxy interruptionFilterProxy) {
         mContext = context.getApplicationContext();
@@ -162,6 +165,7 @@ public final class TelecomSystem {
         Log.initMd5Sum();
 
         Log.startSession("TS.init");
+        mViceNotifier = vicenotifier;
         mPhoneAccountRegistrar = new PhoneAccountRegistrar(mContext);
         mContactsAsyncHelper = new ContactsAsyncHelper(
                 new ContactsAsyncHelper.ContentResolverAdapter() {
@@ -200,6 +204,7 @@ public final class TelecomSystem {
                 defaultDialerAdapter,
                 timeoutsAdapter,
                 asyncRingtonePlayer,
+                mViceNotifier,
                 phoneNumberUtilsAdapter,
                 interruptionFilterProxy);
 

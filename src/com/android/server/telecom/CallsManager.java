@@ -26,7 +26,10 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Message;
 import android.os.Process;
+import android.os.RemoteException;
+import android.os.ServiceManager;
 import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.os.SystemVibrator;
@@ -49,6 +52,7 @@ import android.telecom.VideoProfile;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
+import android.widget.Toast;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.telephony.AsyncEmergencyContactNotifier;
@@ -66,8 +70,12 @@ import com.android.server.telecom.callfiltering.IncomingCallFilter;
 import com.android.server.telecom.components.ErrorDialogActivity;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import com.android.server.telecom.ui.ViceNotificationImpl;
+
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -78,6 +86,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.codeaurora.ims.QtiCallConstants;
+import org.codeaurora.ims.utils.QtiImsExtUtils;
+import org.codeaurora.internal.IExtTelephony;
 /**
  * Singleton.
  *
@@ -108,6 +119,7 @@ public class CallsManager extends Call.ListenerBase
         void onVideoStateChanged(Call call, int previousVideoState, int newVideoState);
         void onCanAddCallChanged(boolean canAddCall);
         void onSessionModifyRequestReceived(Call call, VideoProfile videoProfile);
+        void onSessionModifyRequestSent(VideoProfile fromProfile, VideoProfile toProfile);
         void onHoldToneRequested(Call call);
         void onExternalCallChanged(Call call, boolean isExternalCall);
     }
@@ -120,6 +132,9 @@ public class CallsManager extends Call.ListenerBase
     private static final int MAXIMUM_DIALING_CALLS = 1;
     private static final int MAXIMUM_OUTGOING_CALLS = 1;
     private static final int MAXIMUM_TOP_LEVEL_CALLS = 2;
+    private static final int MAXIMUM_DSDA_LIVE_CALLS = 2;
+    private static final int MAXIMUM_DSDA_HOLD_CALLS = 2;
+    private static final int MAXIMUM_DSDA_TOP_LEVEL_CALLS = 4;
 
     private static final int[] OUTGOING_CALL_STATES =
             {CallState.CONNECTING, CallState.SELECT_PHONE_ACCOUNT, CallState.DIALING,
@@ -194,6 +209,7 @@ public class CallsManager extends Call.ListenerBase
     private final CallerInfoLookupHelper mCallerInfoLookupHelper;
     private final DefaultDialerManagerAdapter mDefaultDialerManagerAdapter;
     private final Timeouts.Adapter mTimeoutsAdapter;
+    private final ViceNotificationImpl mViceNotificationImpl;
     private final PhoneNumberUtilsAdapter mPhoneNumberUtilsAdapter;
     private final NotificationManager mNotificationManager;
     private final Set<Call> mLocallyDisconnectingCalls = new HashSet<>();
@@ -205,7 +221,33 @@ public class CallsManager extends Call.ListenerBase
 
     private TelephonyManager.MultiSimVariants mRadioSimVariants = null;
 
+    private static final int LCH_PLAY_DTMF = 100;
+    private static final int LCH_STOP_DTMF = 101;
+    private static final int PHONE_START_DSDA_INCALL_TONE = 102;
+    private static final int SET_LOCAL_CALL_HOLD = 103;
+    private static final int LCH_DTMF_PERIODICITY = 3000;
+    private static final int LCH_DTMF_PERIOD = 500;
+    private static final String sSupervisoryCallHoldToneConfig =
+            SystemProperties.get("persist.radio.sch_tone", "none");
+    private static final String ACTIVE_SUBSCRIPTION = "active_sub";
+    private static InCallTonePlayer.Factory mPlayerFactory;
+    private String mLchSub = null;
+
+    private InCallTonePlayer mLocalCallReminderTonePlayer = null;
+
     private Runnable mStopTone;
+    private String mActiveSub = null;
+    private DsdaAdapter mDsdaAdapter = null;
+
+    private HashMap<String, Boolean> mLchStatus = new HashMap<String, Boolean>();
+
+    // Two global variables used to handle the Emergency Call when there
+    // is no room available for emergency call. Buffer the Emergency Call
+    // in mPendingMOEmerCall until the Current Active call is disconnected
+    // successfully and place the mPendingMOEmerCall followed by clearing
+    // buffer.
+    private Call mPendingMOEmerCall = null;
+    private Call mDisconnectingCall = null;
 
     /**
      * Initializes the required Telecom components.
@@ -227,6 +269,7 @@ public class CallsManager extends Call.ListenerBase
             DefaultDialerManagerAdapter defaultDialerAdapter,
             Timeouts.Adapter timeoutsAdapter,
             AsyncRingtonePlayer asyncRingtonePlayer,
+            ViceNotifier viceNotifier,
             PhoneNumberUtilsAdapter phoneNumberUtilsAdapter,
             InterruptionFilterProxy interruptionFilterProxy) {
         mContext = context;
@@ -284,6 +327,7 @@ public class CallsManager extends Call.ListenerBase
                 playerFactory, mRinger, new RingbackPlayer(playerFactory), mDtmfLocalTonePlayer);
 
         mHeadsetMediaButton = headsetMediaButtonFactory.create(context, this, mLock);
+        mPlayerFactory = playerFactory;
         mTtyManager = new TtyManager(context, mWiredHeadsetManager);
         mProximitySensorManager = proximitySensorManagerFactory.create(context, this);
         mPhoneStateBroadcaster = new PhoneStateBroadcaster(this);
@@ -291,6 +335,7 @@ public class CallsManager extends Call.ListenerBase
         mConnectionServiceRepository =
                 new ConnectionServiceRepository(mPhoneAccountRegistrar, mContext, mLock, this);
         mInCallWakeLockController = inCallWakeLockControllerFactory.create(context, this);
+        mViceNotificationImpl = viceNotifier.create(mContext, this);
 
         mListeners.add(mInCallWakeLockController);
         mListeners.add(statusBarNotifier);
@@ -301,6 +346,7 @@ public class CallsManager extends Call.ListenerBase
         mListeners.add(missedCallNotifier);
         mListeners.add(mHeadsetMediaButton);
         mListeners.add(mProximitySensorManager);
+        mListeners.add(mViceNotificationImpl);
 
         // There is no USER_SWITCHED broadcast for user 0, handle it here explicitly.
         final UserManager userManager = UserManager.get(mContext);
@@ -308,6 +354,10 @@ public class CallsManager extends Call.ListenerBase
         if (userManager.isPrimaryUser()) {
             onUserSwitch(Process.myUserHandle());
         }
+    }
+
+    ViceNotificationImpl getViceNotificationImpl() {
+        return mViceNotificationImpl;
     }
 
     public void setRespondViaSmsManager(RespondViaSmsManager respondViaSmsManager) {
@@ -398,8 +448,14 @@ public class CallsManager extends Call.ListenerBase
                 Log.i(this, "onCallFilteringCompleted: Call rejected! Exceeds maximum number of " +
                         "dialing calls.");
                 rejectCallAndLog(incomingCall);
+            } else if (!isIncomingVideoCallAllowed(incomingCall, mContext)) {
+                Toast.makeText(mContext, mContext.getResources().
+                        getString(R.string.incoming_call_failed_low_battery), Toast.LENGTH_LONG).
+                        show();
+                rejectCallAndLog(incomingCall);
             } else {
                 addCall(incomingCall);
+                setActiveSubscription(incomingCall.getTargetPhoneAccount().getId());
             }
         } else {
             if (result.shouldReject) {
@@ -449,6 +505,36 @@ public class CallsManager extends Call.ListenerBase
         }
 
         return true;
+    }
+
+    /**
+     * Determines if the incoming video call is allowed or not
+     *
+     * @param Call The incoming call.
+     * @return {@code false} if incoming video call is not allowed.
+     */
+    private static boolean isIncomingVideoCallAllowed(Call call, Context context) {
+        Bundle extras = call.getExtras();
+        if (extras == null || (!isIncomingVideoCall(call)) ||
+                QtiImsExtUtils.allowVideoCallsInLowBattery(context)) {
+            Log.w(TAG, "isIncomingVideoCallAllowed: null Extras or not an incoming video call " +
+                    "or allow video calls in low battery");
+            return true;
+        }
+
+        final boolean isLowBattery = extras.getBoolean(QtiCallConstants.LOW_BATTERY_EXTRA_KEY,
+                false);
+        Log.d(TAG, "isIncomingVideoCallAllowed: lowbattery = " + isLowBattery);
+        return !isLowBattery;
+    }
+
+    private static boolean isIncomingVideoCall(Call call) {
+        if (VideoProfile.isAudioOnly(call.getVideoState())) {
+            return false;
+        }
+
+        final int state = call.getState();
+        return (state == CallState.RINGING);
     }
 
     @Override
@@ -604,6 +690,22 @@ public class CallsManager extends Call.ListenerBase
 
         for (CallsManagerListener listener : mListeners) {
             listener.onSessionModifyRequestReceived(call, videoProfile);
+        }
+    }
+
+    /**
+     * Handles session modification requests sent
+     *
+     * @param fromProfile The video properties prior to the request.
+     * @param toProfile The video properties with the requested changes made.
+     */
+    @Override
+    public void onSessionModifyRequestSent(VideoProfile fromProfile, VideoProfile toProfile) {
+        Log.v(TAG, "onSessionModifyRequestSent : fromProfile = " + fromProfile +
+                " toProfile = " + toProfile);
+
+        for (CallsManagerListener listener : mListeners) {
+            listener.onSessionModifyRequestSent(fromProfile, toProfile);
         }
     }
 
@@ -835,6 +937,12 @@ public class CallsManager extends Call.ListenerBase
                     false /* forceAttachToExistingConnection */,
                     false /* isConference */
             );
+            if ((extras != null) &&
+                    extras.getBoolean(TelephonyProperties.EXTRA_DIAL_CONFERENCE_URI, false)) {
+                //Reset PostDialDigits with empty string for ConfURI call.
+                call.setPostDialDigits("");
+            }
+
             call.initAnalytics();
 
             call.setInitiatingUser(initiatingUser);
@@ -876,7 +984,30 @@ public class CallsManager extends Call.ListenerBase
             call.setVideoState(videoState);
         }
 
-        List<PhoneAccountHandle> accounts = constructPossiblePhoneAccounts(handle, initiatingUser);
+        boolean isAddParticipant = ((extras != null) && (extras.getBoolean(
+                TelephonyProperties.ADD_PARTICIPANT_KEY, false)));
+        boolean isSkipSchemaOrConfUri = ((extras != null) && (extras.getBoolean(
+                TelephonyProperties.EXTRA_SKIP_SCHEMA_PARSING, false) ||
+                extras.getBoolean(TelephonyProperties.EXTRA_DIAL_CONFERENCE_URI, false)));
+
+        if (isAddParticipant) {
+            String number = handle.getSchemeSpecificPart();
+            if (!isSkipSchemaOrConfUri) {
+                number = PhoneNumberUtils.stripSeparators(number);
+            }
+            addParticipant(number);
+            mInCallController.bringToForeground(false);
+            return null;
+        }
+
+        // Force tel scheme for ims conf uri/skip schema calls to avoid selection of sip accounts
+        String scheme = (isSkipSchemaOrConfUri? PhoneAccount.SCHEME_TEL: handle.getScheme());
+
+        Log.d(this, "startOutgoingCall :: isAddParticipant=" + isAddParticipant
+                + " isSkipSchemaOrConfUri=" + isSkipSchemaOrConfUri + " scheme=" + scheme);
+
+        List<PhoneAccountHandle> accounts =
+                constructPossiblePhoneAccounts(handle, initiatingUser, scheme);
         Log.v(this, "startOutgoingCall found accounts = " + accounts);
 
         // Only dial with the requested phoneAccount if it is still valid. Otherwise treat this call
@@ -893,7 +1024,7 @@ public class CallsManager extends Call.ListenerBase
             // handle and verify it can be used.
             if(accounts.size() > 1) {
                 PhoneAccountHandle defaultPhoneAccountHandle =
-                        mPhoneAccountRegistrar.getOutgoingPhoneAccountForScheme(handle.getScheme(),
+                        mPhoneAccountRegistrar.getOutgoingPhoneAccountForScheme(scheme,
                                 initiatingUser);
                 if (defaultPhoneAccountHandle != null &&
                         accounts.contains(defaultPhoneAccountHandle)) {
@@ -903,7 +1034,6 @@ public class CallsManager extends Call.ListenerBase
                 // Use the only PhoneAccount that is available
                 phoneAccountHandle = accounts.get(0);
             }
-
         }
 
         call.setTargetPhoneAccount(phoneAccountHandle);
@@ -946,7 +1076,10 @@ public class CallsManager extends Call.ListenerBase
         // Do not add the call if it is a potential MMI code.
         if ((isPotentialMMICode(handle) || isPotentialInCallMMICode) && !needsAccountSelection) {
             call.addListener(this);
-        } else if (!mCalls.contains(call)) {
+        // If call is Emergency type and marked it as Pending, call would not be added
+        // in mCalls here. It will be handled when the current active call (mDisconnectingCall)
+        // is disconnected successfully.
+        } else if (!mCalls.contains(call) && mPendingMOEmerCall == null) {
             // We check if mCalls already contains the call because we could potentially be reusing
             // a call which was previously added (See {@link #reuseOutgoingCall}).
             addCall(call);
@@ -1012,9 +1145,16 @@ public class CallsManager extends Call.ListenerBase
                 com.android.internal.R.bool.config_requireCallCapableAccountForHandle);
 
         if (call.getTargetPhoneAccount() != null || call.isEmergencyCall()) {
+            if (!call.isEmergencyCall()) {
+                updateLchStatus(call.getTargetPhoneAccount().getId());
+            }
+            //Block to initiate Emregency call now as the current active call
+            //is not yet disconnected.
+            if (mPendingMOEmerCall == null) {
             // If the account has been set, proceed to place the outgoing call.
             // Otherwise the connection will be initiated when the account is set by the user.
-            call.startCreateConnection(mPhoneAccountRegistrar);
+                call.startCreateConnection(mPhoneAccountRegistrar);
+            }
         } else if (mPhoneAccountRegistrar.getCallCapablePhoneAccounts(
                 requireCallCapableAccountByHandle ? call.getHandle().getScheme() : null, false,
                 call.getInitiatingUser()).isEmpty()) {
@@ -1024,6 +1164,23 @@ public class CallsManager extends Call.ListenerBase
             markCallAsRemoved(call);
         }
     }
+
+    /**
+     * Attempts to add participant in a call.
+     *
+     * @param number number to connect the call with.
+     */
+    private void addParticipant(String number) {
+        Log.i(this, "addParticipant number ="+number);
+        if (getForegroundCall() == null) {
+            // don't do anything if the call no longer exists
+            Log.i(this, "Canceling unknown call.");
+            return;
+        } else {
+            getForegroundCall().addParticipantWithConference(number);
+        }
+    }
+
 
     /**
      * Attempts to start a conference call for the specified call.
@@ -1049,20 +1206,21 @@ public class CallsManager extends Call.ListenerBase
         if (!mCalls.contains(call)) {
             Log.i(this, "Request to answer a non-existent call %s", call);
         } else {
-            Call foregroundCall = getForegroundCall();
+            Call activeCall = getFirstCallWithState(call.getTargetPhoneAccount()
+                    .getId(), CallState.ACTIVE, CallState.DIALING);
             // If the foreground call is not the ringing call and it is currently isActive() or
             // STATE_DIALING, put it on hold before answering the call.
-            if (foregroundCall != null && foregroundCall != call &&
-                    (foregroundCall.isActive() ||
-                     foregroundCall.getState() == CallState.DIALING ||
-                     foregroundCall.getState() == CallState.PULLING)) {
-                if (0 == (foregroundCall.getConnectionCapabilities()
+            if (activeCall != null && activeCall != call &&
+                    (activeCall.isActive() ||
+                     activeCall.getState() == CallState.DIALING ||
+                     activeCall.getState() == CallState.PULLING )) {
+                if (0 == (activeCall.getConnectionCapabilities()
                         & Connection.CAPABILITY_HOLD)) {
                     // This call does not support hold.  If it is from a different connection
                     // service, then disconnect it, otherwise allow the connection service to
                     // figure out the right states.
-                    if (foregroundCall.getConnectionService() != call.getConnectionService()) {
-                        foregroundCall.disconnect();
+                    if (activeCall.getConnectionService() != call.getConnectionService()) {
+                        activeCall.disconnect();
                     }
                 } else {
                     Call heldCall = getHeldCall();
@@ -1073,8 +1231,8 @@ public class CallsManager extends Call.ListenerBase
                     }
 
                     Log.v(this, "Holding active/dialing call %s before answering incoming call %s.",
-                            foregroundCall, call);
-                    foregroundCall.hold();
+                            activeCall, call);
+                    activeCall.hold();
                 }
                 // TODO: Wait until we get confirmation of the active call being
                 // on-hold before answering the new call.
@@ -1084,7 +1242,7 @@ public class CallsManager extends Call.ListenerBase
             for (CallsManagerListener listener : mListeners) {
                 listener.onIncomingCallAnswered(call);
             }
-
+            updateLchStatus(call.getTargetPhoneAccount().getId());
             // We do not update the UI until we get confirmation of the answer() through
             // {@link #markCallAsActive}.
             call.answer(videoState);
@@ -1146,6 +1304,7 @@ public class CallsManager extends Call.ListenerBase
             for (CallsManagerListener listener : mListeners) {
                 listener.onIncomingCallRejected(call, rejectWithMessage, textMessage);
             }
+            setActiveSubscription(getConversationSub());
             call.reject(rejectWithMessage, textMessage);
         }
     }
@@ -1246,8 +1405,13 @@ public class CallsManager extends Call.ListenerBase
             boolean otherCallHeld = false;
             Log.d(this, "unholding call: (%s)", call);
             for (Call c : mCalls) {
+                PhoneAccountHandle ph = call.getTargetPhoneAccount();
+                PhoneAccountHandle ph1 = c.getTargetPhoneAccount();
                 // Only attempt to hold parent calls and not the individual children.
-                if (c != null && c.isAlive() && c != call && c.getParentCall() == null) {
+                // if 'c' is not for same subscription as call, then don't disturb 'c'
+                if (c != null && c.isAlive() && c != call && c.getParentCall() == null
+                        && (ph != null && ph1 != null &&
+                        isSamePhAccIdOrSipId(ph.getId(), ph1.getId()))) {
                     otherCallHeld = true;
                     Log.event(c, Log.Events.SWAP);
                     c.hold();
@@ -1265,20 +1429,44 @@ public class CallsManager extends Call.ListenerBase
         if (source != Call.SOURCE_CONNECTION_SERVICE) {
             return;
         }
+
         handleCallTechnologyChange(c);
         handleChildAddressChange(c);
+
+        if (extras != null) {
+            boolean isNeedReset = extras.getBoolean("isNeedReset", false);
+            handleCdmaConnectionTimeReset(c, isNeedReset);
+        }
+        updateCanAddCall();
+    }
+
+    void handleCdmaConnectionTimeReset(Call call, boolean isNeedReset) {
+        if (isNeedReset && call != null) {
+            call.setConnectTimeMillis(System.currentTimeMillis());
+            if (mCalls.contains(call)) {
+                for (CallsManagerListener listener : mListeners) {
+                    listener.onCallStateChanged(call, CallState.ACTIVE, CallState.ACTIVE);
+                }
+            }
+            call.removeExtras(Call.SOURCE_INCALL_SERVICE,
+                    new ArrayList<String>(Arrays.asList("isNeedReset")));
+        }
         updateCanAddCall();
     }
 
     // Construct the list of possible PhoneAccounts that the outgoing call can use based on the
     // active calls in CallsManager. If any of the active calls are on a SIM based PhoneAccount,
     // then include only that SIM based PhoneAccount and any non-SIM PhoneAccounts, such as SIP.
-    private List<PhoneAccountHandle> constructPossiblePhoneAccounts(Uri handle, UserHandle user) {
+    private List<PhoneAccountHandle> constructPossiblePhoneAccounts(
+            Uri handle, UserHandle user, String scheme) {
         if (handle == null) {
             return Collections.emptyList();
         }
+        if (scheme == null) {
+            scheme = handle.getScheme();
+        }
         List<PhoneAccountHandle> allAccounts =
-                mPhoneAccountRegistrar.getCallCapablePhoneAccounts(handle.getScheme(), false, user);
+                mPhoneAccountRegistrar.getCallCapablePhoneAccounts(scheme, false, user);
         // First check the Radio SIM Technology
         if(mRadioSimVariants == null) {
             TelephonyManager tm = (TelephonyManager) mContext.getSystemService(
@@ -1344,6 +1532,15 @@ public class CallsManager extends Call.ListenerBase
             call.setViaNumber(viaNumber);
         }
     }
+    /**
+     *  Returns true if the ids are same or one of the ids is sip id.
+     */
+    private boolean isSamePhAccIdOrSipId(String id1, String id2) {
+        boolean ret = ((id1 != null && id2 != null) &&
+                (id1.equals(id2) || id1.contains("@") || id2.contains("@")));
+        Log.d(this, "isSamePhAccIdOrSipId: id1 = " + id1 + " id2 = " + id2 + " ret = " + ret);
+        return ret;
+    }
 
     /** Called by the in-call UI to change the mute state. */
     void mute(boolean shouldMute) {
@@ -1355,6 +1552,13 @@ public class CallsManager extends Call.ListenerBase
       * speaker phone.
       */
     void setAudioRoute(int route) {
+        Call call = getDialingCall();
+        if (call != null && call.getStartWithSpeakerphoneOn()) {
+            /* There is a change in audio routing preferance for the call.
+             * So, honour the new audio routing preferance.
+             */
+            call.setStartWithSpeakerphoneOn(false);
+        }
         mCallAudioManager.setAudioRoute(route);
     }
 
@@ -1376,7 +1580,18 @@ public class CallsManager extends Call.ListenerBase
         if (!mCalls.contains(call)) {
             Log.i(this, "Attempted to add account to unknown call %s", call);
         } else {
+            Log.i(this, "phoneAccountSelected , id = %s", account.getId());
+            updateLchStatus(account.getId());
             call.setTargetPhoneAccount(account);
+
+            // Set video state after selection of phone account.
+            Bundle extras = call.getIntentExtras();
+            if (extras != null) {
+                int videoState = extras.getInt(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE,
+                        VideoProfile.STATE_AUDIO_ONLY);
+                Log.d(this, "phoneAccountSelected , setVideoState : " + videoState);
+                call.setVideoState(videoState);
+            }
 
             if (!call.isNewOutgoingCallIntentBroadcastDone()) {
                 return;
@@ -1413,7 +1628,9 @@ public class CallsManager extends Call.ListenerBase
 
     void markCallAsDialing(Call call) {
         setCallState(call, CallState.DIALING, "dialing set explicitly");
+        maybeMoveToEarpiece(call);
         maybeMoveToSpeakerPhone(call);
+        setActiveSubscription(call.getTargetPhoneAccount().getId());
     }
 
     void markCallAsPulling(Call call) {
@@ -1438,7 +1655,44 @@ public class CallsManager extends Call.ListenerBase
      */
     void markCallAsDisconnected(Call call, DisconnectCause disconnectCause) {
         call.setDisconnectCause(disconnectCause);
+        int prevState = call.getState();
         setCallState(call, CallState.DISCONNECTED, "disconnected set explicitly");
+        String lchSub = getLchSub();
+        String subId = (call.getTargetPhoneAccount() == null) ? null :
+                call.getTargetPhoneAccount().getId();
+        String subInConversation = getConversationSub();
+        if (subId != null && subId.equals(mActiveSub) &&
+                getFirstCallWithState(subId, CallState.RINGING) == null  &&
+                (subInConversation != null && !subInConversation.equals(mActiveSub))) {
+            Log.d(this,"Set active sub to conversation sub");
+            switchToOtherActiveSub(subInConversation);
+        } else if ((subInConversation == null) && (lchSub != null) &&
+                ((prevState == CallState.CONNECTING) || (prevState ==
+                CallState.SELECT_PHONE_ACCOUNT)) &&
+                (call.getState() == CallState.DISCONNECTED)) {
+            Log.d(this,"remove sub with call from LCH");
+            updateLchStatus(lchSub);
+            setActiveSubscription(lchSub);
+            manageDsdaInCallTones(false);
+        }
+        boolean isLchEnabled = (mLchStatus.get(subId) == null) ? false : mLchStatus.get(subId);
+        if ((subId != null) && isLchEnabled) {
+            Call activecall = getFirstCallWithState(subId, CallState.RINGING, CallState.DIALING,
+                    CallState.ACTIVE, CallState.ON_HOLD);
+            Log.d(this,"activecall: " + activecall);
+            if (activecall == null) {
+                mLchStatus.put(subId, false);
+                manageDsdaInCallTones(false);
+            }
+        }
+        // Emergency MO call is still pending and current active call is
+        // disconnected succesfully. So initiating pending Emergency call
+        // now and clearing both pending and Disconnectcalls.
+        if (mPendingMOEmerCall != null && mDisconnectingCall == call) {
+            addCall(mPendingMOEmerCall);
+            mPendingMOEmerCall.startCreateConnection(mPhoneAccountRegistrar);
+            clearPendingMOEmergencyCall();
+        }
     }
 
     /**
@@ -1446,13 +1700,22 @@ public class CallsManager extends Call.ListenerBase
      */
     void markCallAsRemoved(Call call) {
         removeCall(call);
+        if (!hasAnyCalls()) {
+            updateLchStatus(null);
+            setActiveSubscription(null);
+            manageDsdaInCallTones(false);
+        }
         Call foregroundCall = mCallAudioManager.getPossiblyHeldForegroundCall();
+        boolean isChildCall = call.isChildCall();
         if (mLocallyDisconnectingCalls.contains(call)) {
+            Log.v(this, "markCallAsRemoved: isChildCall = "
+                + isChildCall + "call -> %s", call);
             mLocallyDisconnectingCalls.remove(call);
-            if (foregroundCall != null && foregroundCall.getState() == CallState.ON_HOLD) {
+            if (!isChildCall && foregroundCall != null
+                    && foregroundCall.getState() == CallState.ON_HOLD) {
                 foregroundCall.unhold();
             }
-        } else if (foregroundCall != null &&
+        } else if (!isChildCall && foregroundCall != null &&
                 !foregroundCall.can(Connection.CAPABILITY_SUPPORT_HOLD)  &&
                 foregroundCall.getState() == CallState.ON_HOLD) {
 
@@ -1503,6 +1766,10 @@ public class CallsManager extends Call.ListenerBase
 
     boolean hasActiveOrHoldingCall() {
         return getFirstCallWithState(CallState.ACTIVE, CallState.ON_HOLD) != null;
+    }
+
+    boolean hasActiveOrHoldingCall(String sub) {
+        return (getFirstCallWithState(sub, CallState.ACTIVE, CallState.ON_HOLD) != null);
     }
 
     boolean hasRingingCall() {
@@ -1573,7 +1840,12 @@ public class CallsManager extends Call.ListenerBase
             // we could put InCallServices into a state where they are showing two calls but
             // also support add-call. Technically it's right, but overall looks better (UI-wise)
             // and acts better if we wait until the call is removed.
-            if (count >= MAXIMUM_TOP_LEVEL_CALLS) {
+            if (TelephonyManager.getDefault().getMultiSimConfiguration()
+                    == TelephonyManager.MultiSimVariants.DSDA) {
+                if (count >= MAXIMUM_DSDA_TOP_LEVEL_CALLS) {
+                    return false;
+                }
+            } else if (count >= MAXIMUM_TOP_LEVEL_CALLS) {
                 return false;
             }
         }
@@ -1618,7 +1890,7 @@ public class CallsManager extends Call.ListenerBase
 
     @VisibleForTesting
     public Call getFirstCallWithState(int... states) {
-        return getFirstCallWithState(null, states);
+        return getFirstCallWithState((Call) null, states);
     }
 
     @VisibleForTesting
@@ -1656,6 +1928,43 @@ public class CallsManager extends Call.ListenerBase
                 }
 
                 if (currentState == call.getState()) {
+                    return call;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the first call that it finds with the given states for given subscription.
+     * the states are treated as having priority order so that any call with the first
+     * state will be returned before any call with states listed later in the parameter list.
+     *
+     * @param subId check calls only on this subscription
+     * @param callToSkip Call that this method should skip while searching
+     */
+    Call getFirstCallWithState(String subId, Call callToSkip, int... states) {
+        for (int currentState : states) {
+            // check the foreground first
+            Call foregroundCall = getForegroundCall();
+            if (foregroundCall != null && foregroundCall.getState() == currentState
+                    && foregroundCall.getTargetPhoneAccount() != null
+                    && isSamePhAccIdOrSipId(foregroundCall.getTargetPhoneAccount().getId(), subId)) {
+                return foregroundCall;
+            }
+
+            for (Call call : mCalls) {
+                if (Objects.equals(callToSkip, call)) {
+                    continue;
+                }
+
+                // Only operate on top-level calls
+                if (call.getParentCall() != null) {
+                    continue;
+                }
+
+                if (currentState == call.getState() && call.getTargetPhoneAccount() != null
+                        && isSamePhAccIdOrSipId(call.getTargetPhoneAccount().getId(), subId)) {
                     return call;
                 }
             }
@@ -1863,6 +2172,7 @@ public class CallsManager extends Call.ListenerBase
             }
             Trace.endSection();
         }
+        manageDsdaInCallTones(false);
     }
 
     private void updateCanAddCall() {
@@ -1926,16 +2236,42 @@ public class CallsManager extends Call.ListenerBase
         return count;
     }
 
+    private int getNumCallsWithState(String subId, int... states) {
+        int count = 0;
+        for (int state : states) {
+            for (Call call : mCalls) {
+                if (call.getParentCall() == null && call.getState() == state
+                        && call.getTargetPhoneAccount() != null
+                        && isSamePhAccIdOrSipId(call.getTargetPhoneAccount().getId(), subId)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
     private boolean hasMaximumLiveCalls() {
         return MAXIMUM_LIVE_CALLS <= getNumCallsWithState(LIVE_CALL_STATES);
+    }
+
+    private boolean hasMaximumLiveCalls(String subId) {
+        return MAXIMUM_LIVE_CALLS <= getNumCallsWithState(subId, LIVE_CALL_STATES);
     }
 
     private boolean hasMaximumHoldingCalls() {
         return MAXIMUM_HOLD_CALLS <= getNumCallsWithState(CallState.ON_HOLD);
     }
 
+    private boolean hasMaximumHoldingCalls(String subId) {
+        return MAXIMUM_HOLD_CALLS <= getNumCallsWithState(subId, CallState.ON_HOLD);
+    }
+
     private boolean hasMaximumRingingCalls() {
         return MAXIMUM_RINGING_CALLS <= getNumCallsWithState(CallState.RINGING);
+    }
+
+    private boolean hasMaximumRingingCalls(String subId) {
+        return MAXIMUM_RINGING_CALLS <= getNumCallsWithState(subId, CallState.RINGING);
     }
 
     private boolean hasMaximumOutgoingCalls() {
@@ -1946,7 +2282,34 @@ public class CallsManager extends Call.ListenerBase
         return MAXIMUM_DIALING_CALLS <= getNumCallsWithState(CallState.DIALING, CallState.PULLING);
     }
 
+    /**
+     * Returns true if there is an Emergency Call in Call list.
+     */
+    private boolean IsEmergencyCallInProgress() {
+        for (Call call : mCalls) {
+            if (call.isEmergencyCall()) {
+                // We never support add call if one of the calls is an emergency call.
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean makeRoomForOutgoingCall(Call call, boolean isEmergency) {
+        if (isEmergency && IsEmergencyCallInProgress()) {
+            Log.i(this, "emergency call is progress so no room for new E Call");
+            return false;
+        }
+        if (TelephonyManager.getDefault().getMultiSimConfiguration()
+                == TelephonyManager.MultiSimVariants.DSDA) {
+            return makeRoomForOutgoingCallForDsda(call, isEmergency);
+        }
+        // Reject If there is any Incoming Call while initiating an
+        // an Emergency Call.
+        if (isEmergency && hasMaximumRingingCalls()) {
+            Call rinigingCall = getRingingCall();
+            rinigingCall.reject(false, null);
+        }
         if (hasMaximumLiveCalls()) {
             // NOTE: If the amount of live calls changes beyond 1, this logic will probably
             // have to change.
@@ -1970,6 +2333,12 @@ public class CallsManager extends Call.ListenerBase
                     call.getAnalytics().setCallIsAdditional(true);
                     outgoingCall.getAnalytics().setCallIsInterrupted(true);
                     outgoingCall.disconnect();
+                    // buffer this call in to mPendingMOEmerCall and do not initiate this call
+                    // until the current outgoing call mDisconnectingCall is disconnected
+                    // successfully. Emergency Call would be initiated upon receiving the
+                    // Disconnection response from lower layers.
+                    mDisconnectingCall = outgoingCall;
+                    mPendingMOEmerCall = call;
                     return true;
                 }
                 if (outgoingCall.getState() == CallState.SELECT_PHONE_ACCOUNT) {
@@ -1991,6 +2360,12 @@ public class CallsManager extends Call.ListenerBase
                     call.getAnalytics().setCallIsAdditional(true);
                     liveCall.getAnalytics().setCallIsInterrupted(true);
                     liveCall.disconnect();
+                    // buffer this call in to mPendingMOEmerCall and do not initiate this call
+                    // until the current live call "mDisconnectingCall" is disconnected
+                    // successfully. Emergency Call would be initiated upon receiving the
+                    // Disconnection response from lower layers.
+                    mDisconnectingCall = liveCall;
+                    mPendingMOEmerCall = call;
                     return true;
                 }
                 return false;  // No more room!
@@ -2047,6 +2422,44 @@ public class CallsManager extends Call.ListenerBase
         return true;
     }
 
+    private boolean makeRoomForOutgoingCallForDsda(Call call, boolean isEmergency) {
+        if (isEmergency || (call.getState() == CallState.SELECT_PHONE_ACCOUNT)) {
+            return true;
+        }
+
+        PhoneAccountHandle phAcc = call.getTargetPhoneAccount();
+        if (phAcc == null) {
+            if (getNumCallsWithState(LIVE_CALL_STATES) == MAXIMUM_DSDA_LIVE_CALLS
+                    && getNumCallsWithState(CallState.ON_HOLD) == MAXIMUM_DSDA_HOLD_CALLS) {
+                return false;
+            } else {
+                return true;
+            }
+        }
+        if (hasMaximumLiveCalls(phAcc.getId())) {
+            // NOTE: If the amount of live calls changes beyond 1, this logic will probably
+            // have to change.
+            Call liveCall = getFirstCallWithState(phAcc.getId(), call, LIVE_CALL_STATES);
+
+            if (hasMaximumHoldingCalls(phAcc.getId())) {
+                // There is no more room for any more calls, unless it's an emergency.
+                return false;  // No more room!
+            }
+            if (Objects.equals(liveCall.getTargetPhoneAccount(), call.getTargetPhoneAccount())) {
+                return true;
+            }
+            // Try to hold the live call before attempting the new outgoing call.
+            if (liveCall.can(Connection.CAPABILITY_HOLD)) {
+                liveCall.hold();
+                return true;
+            }
+
+            // The live call cannot be held so we're out of luck here.  There's no room.
+            return false;
+        }
+        return true;
+    }
+
     /**
      * Given a call, find the first non-null phone account handle of its children.
      *
@@ -2070,6 +2483,13 @@ public class CallsManager extends Call.ListenerBase
         if (call.getStartWithSpeakerphoneOn()) {
             setAudioRoute(CallAudioState.ROUTE_SPEAKER);
             call.setStartWithSpeakerphoneOn(false);
+        }
+    }
+
+    private void maybeMoveToEarpiece(Call call) {
+        if (!call.getStartWithSpeakerphoneOn() && !mWiredHeadsetManager.isPluggedIn() &&
+                !mBluetoothManager.isBluetoothAvailable()) {
+            setAudioRoute(CallAudioState.ROUTE_EARPIECE);
         }
     }
 
@@ -2264,5 +2684,340 @@ public class CallsManager extends Call.ListenerBase
               SystemClock.elapsedRealtime());
 
       call.setIntentExtras(extras);
+    }
+
+    private final Handler mLchHandler = new LchHandler();
+    private final class LchHandler extends Handler {
+        @Override
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case PHONE_START_DSDA_INCALL_TONE:
+                    Log.d(this, "Start DSDA incall tones...");
+                    startDsdaInCallTones();
+                    break;
+                case LCH_PLAY_DTMF:
+                    playLchDtmf();
+                    break;
+                case LCH_STOP_DTMF:
+                    stopLchDtmf();
+                    break;
+                case SET_LOCAL_CALL_HOLD:
+                    updateLchStatusToRil((String) msg.obj);
+                    break;
+            }
+        }
+    }
+
+    void switchToOtherActiveSub(String subId) {
+        if (TelephonyManager.getDefault().getMultiSimConfiguration()
+                != TelephonyManager.MultiSimVariants.DSDA) {
+            return;
+        }
+        Log.d(this, "switchToOtherActiveSub sub:" + subId);
+        setActiveSubscription(subId);
+        updateLchStatus(subId);
+        manageDsdaInCallTones(true);
+    }
+
+    String getActiveSubscription() {
+        return mActiveSub;
+    }
+
+    synchronized void setActiveSubscription(String subId) {
+        if (TelephonyManager.getDefault().getMultiSimConfiguration()
+                != TelephonyManager.MultiSimVariants.DSDA) {
+            return;
+        }
+        Log.d(this, "setActiveSubscription = " + subId);
+        if (subId == null) {
+            mActiveSub = null;
+            return;
+        }
+        if (subId.equals(mActiveSub)) {
+            Log.d(this, "setActiveSubscription not changed " + subId + " mActiveSub:" + mActiveSub);
+            return;
+        }
+        mActiveSub = subId;
+        Log.d(this, "setActiveSubscription changed " + mActiveSub);
+        for (Call call : mCalls) {
+            PhoneAccountHandle ph = call.getTargetPhoneAccount();
+            if (ph != null && subId.equals(ph.getId())) {
+                Bundle extras = new Bundle();
+                extras.putBoolean(ACTIVE_SUBSCRIPTION, true);
+                call.putExtras(Call.SOURCE_CONNECTION_SERVICE, extras);
+            } else {
+                Bundle extras = new Bundle();
+                extras.putBoolean(ACTIVE_SUBSCRIPTION, false);
+                call.putExtras(Call.SOURCE_CONNECTION_SERVICE, extras);
+            }
+        }
+    }
+
+    void manageDsdaInCallTones(boolean isSubSwitch) {
+        Log.d(this, " entered manageDsdaInCallTones ");
+
+        // If there is no background active subscription available, stop playing the tones.
+        // Do not start/stop LCH/SCH tones when phone is in RINGING state.
+        if (getLchSub() != null && !hasRingingCall()) {
+            //If sub switch happens re-start the tones with a delay of 100msec.
+            if (isSubSwitch) {
+                Log.d(this, " manageDsdaInCallTones: re-start playing tones, lch sub = "
+                        + getLchSub());
+                reStartDsdaInCallTones();
+            } else {
+                Log.d(this, " entered manageDsdaInCallTones ");
+                startDsdaInCallTones();
+            }
+        } else if (getLchSub() == null) {
+            // if there is no sub in Lch state, then stop playing the tones
+            stopMSimInCallTones();
+        }
+    }
+
+    private void reStartDsdaInCallTones() {
+        Log.d(this, " reStartDsdaInCallTones");
+        stopMSimInCallTones();
+        /* Remove any pending PHONE_START_DSDA_INCALL_TONE messages from queue */
+        mLchHandler.removeMessages(PHONE_START_DSDA_INCALL_TONE);
+        Message message = Message.obtain(mLchHandler, PHONE_START_DSDA_INCALL_TONE);
+        mLchHandler.sendMessageDelayed(message, 100);
+    }
+
+    /**
+     * Returns the first call that it finds with the given states for given subscription.
+     * The states are treated as having priority order so that any call with the first
+     * state will be returned before any call with states listed later in the parameter list.
+     */
+    Call getFirstCallWithState(String sub, int... states) {
+        for (int currentState : states) {
+            // check the foreground first
+            Call foregroundCall = getForegroundCall();
+            if (foregroundCall != null && foregroundCall.getState() == currentState
+                    && (foregroundCall.getTargetPhoneAccount() != null)
+                    && isSamePhAccIdOrSipId(foregroundCall.getTargetPhoneAccount().getId(),
+                    sub)) {
+                return foregroundCall;
+            }
+
+            for (Call call : mCalls) {
+                if ((currentState == call.getState()) &&
+                        (call.getTargetPhoneAccount() != null) &&
+                        (isSamePhAccIdOrSipId(call.getTargetPhoneAccount().getId(), sub))) {
+                    return call;
+                }
+            }
+        }
+        return null;
+    }
+    /**
+     * Check whether any other sub is in active state other than
+     * provided subscription, if yes return the other active sub.
+     * @return subscription which is active.
+     */
+    private String getOtherActiveSub(String subscription) {
+        String otherSub = null;;
+        for (PhoneAccountHandle ph : getPhoneAccountRegistrar()
+                .getSimPhoneAccountsOfCurrentUser()) {
+            String sub = ph.getId();
+            if (!sub.equals(subscription) && getFirstCallWithState(sub, CallState.CONNECTING,
+                    CallState.DIALING, CallState.ACTIVE) != null) {
+                otherSub = sub;
+            }
+        }
+        return otherSub;
+    }
+
+    private String getConversationSub() {
+        for (PhoneAccountHandle ph : getPhoneAccountRegistrar()
+                .getSimPhoneAccountsOfCurrentUser()) {
+            String sub = ph.getId();
+            if ((mLchStatus.get(sub) == null || mLchStatus.get(sub) == false)
+                    && getFirstCallWithState(sub, CallState.CONNECTING,
+                    CallState.DIALING, CallState.ACTIVE) != null) {
+                return sub;
+            }
+        }
+        return null;
+    }
+
+    private String getLchSub() {
+        Iterator<String> keySetIterator = mLchStatus.keySet().iterator();
+        while(keySetIterator.hasNext()){
+            String sub = keySetIterator.next();
+            if (mLchStatus.get(sub)!= null && mLchStatus.get(sub)) {
+                return sub;
+            }
+        }
+        return null;
+    }
+
+    private void playLchDtmf() {
+        if (mLchSub != null || mLchHandler.hasMessages(LCH_PLAY_DTMF)) {
+            // Ignore any redundant requests to start playing tones
+            return;
+        }
+        mLchSub = getLchSub();
+        Log.d(this, " playLchDtmf... lch sub " + mLchSub);
+        if (mLchSub == null) return;
+        removeAnyPendingDtmfMsgs();
+        char c = mContext.getResources()
+                .getString(R.string.lch_dtmf_key).charAt(0);
+        Call call = getNonRingingLiveCall(mLchSub);
+        if (call == null) {
+            mLchSub = null;
+            return;
+        }
+        call.playDtmfTone(c);
+        // Keep playing LCH DTMF tone to remote party on LCH call, with periodicity
+        // "LCH_DTMF_PERIODICITY" until call moves out of LCH.
+        mLchHandler.sendMessageDelayed(Message.obtain(mLchHandler, LCH_PLAY_DTMF),
+                LCH_DTMF_PERIODICITY);
+        mLchHandler.sendMessageDelayed(Message.obtain(mLchHandler, LCH_STOP_DTMF), LCH_DTMF_PERIOD);
+    }
+
+    private Call getNonRingingLiveCall(String subId) {
+        return getFirstCallWithState(subId, CallState.DIALING,
+                CallState.ACTIVE, CallState.ON_HOLD);
+    }
+
+    private void stopLchDtmf() {
+        if (mLchSub != null) {
+            // Ignore any redundant requests to stop playing tones
+            Call call = getNonRingingLiveCall(mLchSub);
+            Log.d(this, " stopLchDtmf... call: " + call + " mLchSub:" + mLchSub);
+            if (call == null) {
+                mLchSub = null;
+                return;
+            }
+            call.stopDtmfTone();
+        }
+        mLchSub = null;
+    }
+
+    private void startDsdaInCallTones() {
+        if (mLocalCallReminderTonePlayer == null) {
+            Log.d(this, " Play local call hold reminder tone ");
+            mLocalCallReminderTonePlayer =
+                    mPlayerFactory.createPlayer(InCallTonePlayer.TONE_HOLD_RECALL);
+            mLocalCallReminderTonePlayer.start();
+        }
+        if (sSupervisoryCallHoldToneConfig.equals("dtmf")) {
+            Log.d(this, " startDsdaInCallTones: Supervisory call hold tone over dtmf ");
+            playLchDtmf();
+        }
+    }
+
+    private void removeAnyPendingDtmfMsgs() {
+        mLchHandler.removeMessages(LCH_PLAY_DTMF);
+        mLchHandler.removeMessages(LCH_STOP_DTMF);
+    }
+
+    protected void stopMSimInCallTones() {
+        if (mLocalCallReminderTonePlayer != null) {
+            Log.d(this, " stopMSimInCallTones: local call hold reminder tone ");
+            mLocalCallReminderTonePlayer.stopTone();
+            mLocalCallReminderTonePlayer = null;
+        }
+        if (sSupervisoryCallHoldToneConfig.equals("dtmf")) {
+            Log.d(this, " stopMSimInCallTones: stop SCH Dtmf call hold tone ");
+            stopLchDtmf();
+            /* Remove any previous dtmf nssages from queue */
+            removeAnyPendingDtmfMsgs();
+        }
+    }
+
+    private void updateLchStatus (String subId) {
+        mLchHandler.obtainMessage(SET_LOCAL_CALL_HOLD, subId).sendToTarget();
+    }
+
+    /**
+     * Update the local call hold state for all subscriptions
+     * 1 -- if call on local hold, 0 -- if call is not on local hold
+     *
+     * @param subInConversation is the sub user is currently active in subsription.
+     * so if this sub is in LCH, then bring that sub out of LCH.
+     */
+    private void updateLchStatusToRil(String subInConversation) {
+        String removeFromLch = null;
+        Log.d(this, "updateLchStatusToRil subInConversation: " + subInConversation);
+        if ((subInConversation != null && (subInConversation.contains("sip")
+                || subInConversation.contains("@")))
+                || (TelephonyManager.getDefault()
+                .getMultiSimConfiguration() != TelephonyManager.MultiSimVariants.DSDA)) {
+            return;
+        }
+        for (PhoneAccountHandle ph : getPhoneAccountRegistrar()
+                .getSimPhoneAccountsOfCurrentUser()) {
+            String sub = ph.getId();
+            if (sub != null && sub.contains("sip")) {
+                Log.d(this, "update lch. Skipping account: " + sub);
+                continue;
+            }
+            boolean lchState = false;
+            Boolean isLchEnabled = mLchStatus.get(sub);
+            isLchEnabled = (isLchEnabled == null) ? false : isLchEnabled;
+            if (subInConversation != null && hasActiveOrHoldingCall(sub) &&
+                    !sub.equals(subInConversation)) {
+                // if sub is not conversation  sub and if it has an active
+                // voice call then update lchStatus as Active
+                lchState = true;
+            }
+
+            // Update state only if the new state is different
+            if (lchState != isLchEnabled) {
+                Call call = getNonRingingLiveCall(sub);
+                Log.d(this, " setLocal Call Hold to  = " + lchState + " sub:" + sub);
+
+                if (lchState) {
+                    mLchStatus.put(sub, true);
+                    setLocalCallHold(sub, true);
+                } else {
+                    removeFromLch = sub;
+                    mLchStatus.put(sub, false);
+                }
+            }
+        }
+        if (removeFromLch != null) {
+            // Ensure to send LCH disable request at last, to make sure that during switch
+            // subscription, both subscriptions not to be in active(non-LCH) at any moment.
+            setLocalCallHold(removeFromLch, false);
+        }
+    }
+
+    void setDsdaAdapter() {
+        if (mDsdaAdapter != null) {
+            return;
+        }
+        mDsdaAdapter = new DsdaAdapter(this);
+        IExtTelephony mExtTelephony = IExtTelephony.Stub.asInterface(ServiceManager
+            .getService("extphone"));
+        try {
+            Log.d(this, "setDsdaAdapter");
+            mExtTelephony.setDsdaAdapter(mDsdaAdapter);
+        } catch (NullPointerException ex) {
+            Log.d(this, "setDsdaAdapter" + ex);
+        } catch (RemoteException ex) {
+            Log.d(this, "setDsdaAdapter" + ex);
+        }
+    }
+
+    private void setLocalCallHold(String subscriptionId, boolean enable) {
+        IExtTelephony mExtTelephony = IExtTelephony.Stub.asInterface(ServiceManager
+            .getService("extphone"));
+        try {
+            Log.d(this, "setLocalCallHold" + subscriptionId);
+            mExtTelephony.setLocalCallHold(Integer.parseInt(subscriptionId), enable);
+        } catch (NullPointerException ex) {
+            Log.d(this, "setLocalCallHold" + ex);
+        } catch (RemoteException ex) {
+            Log.d(this, "setLocalCallHold" + ex);
+        } catch (NumberFormatException ex) {
+            Log.d(this, "setLocalCallHold" + ex);
+        }
+    }
+
+    public void clearPendingMOEmergencyCall() {
+        mPendingMOEmerCall = null;
+        mDisconnectingCall = null;
     }
 }

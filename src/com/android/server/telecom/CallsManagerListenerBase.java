@@ -82,6 +82,10 @@ public class CallsManagerListenerBase implements CallsManager.CallsManagerListen
     }
 
     @Override
+    public void onSessionModifyRequestSent(VideoProfile fromProfile, VideoProfile toProfile) {
+    }
+
+    @Override
     public void onHoldToneRequested(Call call) {
     }
 

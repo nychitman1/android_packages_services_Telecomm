@@ -28,6 +28,7 @@ import android.os.Looper;
 import android.os.UserHandle;
 import android.os.PersistableBundle;
 import android.provider.CallLog.Calls;
+import android.telecom.Connection;
 import android.telecom.DisconnectCause;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
@@ -218,9 +219,9 @@ public final class CallLogManager extends CallsManagerListenerBase {
         int callFeatures = getCallFeatures(call.getVideoStateHistory(),
                 call.getDisconnectCause().getCode() == DisconnectCause.CALL_PULLED);
         logCall(call.getCallerInfo(), logNumber, call.getPostDialDigits(), formattedViaNumber,
-                call.getHandlePresentation(), callLogType, callFeatures, accountHandle,
-                creationTime, age, callDataUsage, call.isEmergencyCall(), call.getInitiatingUser(),
-                logCallCompletedListener);
+                call.getHandlePresentation(), toPreciseLogType(call, callLogType), callFeatures,
+                accountHandle, creationTime, age, callDataUsage, call.isEmergencyCall(),
+                call.getInitiatingUser(), logCallCompletedListener);
     }
 
     /**
@@ -467,5 +468,44 @@ public final class CallLogManager extends CallsManagerListenerBase {
             }
             return mCurrentCountryIso;
         }
+    }
+
+    private int toPreciseLogType(Call call, int callLogType) {
+        final boolean isHighDefAudioCall =
+               (call != null) && call.hasProperty(Connection.PROPERTY_HIGH_DEF_AUDIO);
+        final boolean isWifiCall =
+               (call != null) && call.hasProperty(Connection.PROPERTY_WIFI);
+        Log.d(TAG, "callProperties: " + call.getConnectionProperties()
+                + "isHighDefAudioCall: " + isHighDefAudioCall
+                + "isWifiCall: " + isWifiCall);
+        if(!isHighDefAudioCall && !isWifiCall) {
+            return callLogType;
+        }
+        switch (callLogType) {
+            case Calls.INCOMING_TYPE :
+                if(isWifiCall) {
+                    callLogType = Calls.INCOMING_WIFI_TYPE;
+                } else {
+                    callLogType = Calls.INCOMING_IMS_TYPE;
+                }
+                break;
+            case Calls.OUTGOING_TYPE :
+                if(isWifiCall) {
+                    callLogType = Calls.OUTGOING_WIFI_TYPE;
+                } else {
+                    callLogType = Calls.OUTGOING_IMS_TYPE;
+                }
+                break;
+            case Calls.MISSED_TYPE :
+                if(isWifiCall) {
+                    callLogType = Calls.MISSED_WIFI_TYPE;
+                } else {
+                    callLogType = Calls.MISSED_IMS_TYPE;
+                }
+                break;
+            default:
+                //Normal cs call, no change
+        }
+        return callLogType;
     }
 }

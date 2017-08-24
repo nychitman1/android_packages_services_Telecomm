@@ -37,6 +37,7 @@ import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.text.Spannable;
 import android.text.SpannableString;
+import android.text.TextUtils;
 import android.widget.Toast;
 
 import java.util.ArrayList;
@@ -136,7 +137,7 @@ public class RespondViaSmsManager extends CallsManagerListenerBase {
             int subId = mCallsManager.getPhoneAccountRegistrar().getSubscriptionIdForPhoneAccount(
                     call.getTargetPhoneAccount());
             rejectCallWithMessage(call.getContext(), call.getHandle().getSchemeSpecificPart(),
-                    textMessage, subId);
+                    textMessage, subId, call.getName());
         }
     }
 
@@ -175,8 +176,8 @@ public class RespondViaSmsManager extends CallsManagerListenerBase {
      * Reject the call with the specified message. If message is null this call is ignored.
      */
     private void rejectCallWithMessage(Context context, String phoneNumber, String textMessage,
-            int subId) {
-        if (textMessage != null) {
+            int subId, String contactName) {
+        if (textMessage != null && !TextUtils.isEmpty(textMessage)) {
             final ComponentName component =
                     SmsApplication.getDefaultRespondViaMessageApplication(context,
                             true /*updateIfNeeded*/);
@@ -190,7 +191,7 @@ public class RespondViaSmsManager extends CallsManagerListenerBase {
                 }
 
                 SomeArgs args = SomeArgs.obtain();
-                args.arg1 = phoneNumber;
+                args.arg1 = !TextUtils.isEmpty(contactName) ? contactName : phoneNumber;
                 args.arg2 = context;
                 mHandler.obtainMessage(MSG_SHOW_SENT_TOAST, args).sendToTarget();
                 intent.setComponent(component);

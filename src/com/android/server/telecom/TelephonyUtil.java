@@ -23,7 +23,8 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
 import android.net.Uri;
-import android.telecom.InCallService;
+import android.os.ServiceManager;
+import android.os.RemoteException;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telephony.PhoneNumberUtils;
@@ -31,6 +32,7 @@ import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 
 import com.android.internal.annotations.VisibleForTesting;
+import org.codeaurora.internal.IExtTelephony;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -47,6 +49,8 @@ public final class TelephonyUtil {
 
     private static final String PSTN_CALL_SERVICE_CLASS_NAME =
             "com.android.services.telephony.TelephonyConnectionService";
+
+    private static final String LOG_TAG = "TelephonyUtil";
 
     private static final PhoneAccountHandle DEFAULT_EMERGENCY_PHONE_ACCOUNT_HANDLE =
             new PhoneAccountHandle(
@@ -77,8 +81,35 @@ public final class TelephonyUtil {
     }
 
     public static boolean shouldProcessAsEmergency(Context context, Uri handle) {
-        return handle != null && PhoneNumberUtils.isLocalEmergencyNumber(
-                context, handle.getSchemeSpecificPart());
+        return handle != null && isLocalEmergencyNumber(handle.getSchemeSpecificPart());
+    }
+
+    public static boolean isLocalEmergencyNumber(String address) {
+        IExtTelephony mIExtTelephony =
+            IExtTelephony.Stub.asInterface(ServiceManager.getService("extphone"));
+        boolean result = false;
+        try {
+            result = mIExtTelephony.isLocalEmergencyNumber(address);
+        }catch (RemoteException ex) {
+            Log.e(LOG_TAG, ex, "RemoteException");
+        } catch (NullPointerException ex) {
+            Log.e(LOG_TAG, ex, "NullPointerException");
+        }
+        return result;
+    }
+
+    public static boolean isPotentialLocalEmergencyNumber(String address) {
+        IExtTelephony mIExtTelephony =
+            IExtTelephony.Stub.asInterface(ServiceManager.getService("extphone"));
+        boolean result = false;
+        try {
+            result = mIExtTelephony.isPotentialLocalEmergencyNumber(address);
+        }catch (RemoteException ex) {
+            Log.e(LOG_TAG, ex, "RemoteException");
+        } catch (NullPointerException ex) {
+            Log.e(LOG_TAG, ex, "NullPointerException");
+        }
+        return result;
     }
 
     public static void sortSimPhoneAccounts(Context context, List<PhoneAccount> accounts) {

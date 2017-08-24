@@ -87,6 +87,8 @@ import com.android.server.telecom.ui.MissedCallNotifierImpl.MissedCallNotifierIm
 
 import com.google.common.base.Predicate;
 
+import com.android.server.telecom.ViceNotifier;
+import com.android.server.telecom.ui.ViceNotificationImpl;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.invocation.InvocationOnMock;
@@ -192,6 +194,7 @@ public class TelecomSystemTest extends TelecomTestCase {
     @Mock InCallWakeLockController mInCallWakeLockController;
     @Mock BluetoothPhoneServiceImpl mBluetoothPhoneServiceImpl;
     @Mock AsyncRingtonePlayer mAsyncRingtonePlayer;
+    @Mock ViceNotifier mViceNotifier;
     @Mock InterruptionFilterProxy mInterruptionFilterProxy;
 
     final ComponentName mInCallServiceComponentNameX =
@@ -406,6 +409,7 @@ public class TelecomSystemTest extends TelecomTestCase {
                 },
                 mTimeoutsAdapter,
                 mAsyncRingtonePlayer,
+                mViceNotifier,
                 mPhoneNumberUtilsAdapter,
                 mInterruptionFilterProxy);
 

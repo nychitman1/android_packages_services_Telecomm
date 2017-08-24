@@ -3,9 +3,13 @@ LOCAL_PATH:= $(call my-dir)
 # Build the Telecom service.
 include $(CLEAR_VARS)
 
-LOCAL_JAVA_LIBRARIES := telephony-common
+LOCAL_JAVA_LIBRARIES := telephony-common telephony-ext ims-common
+LOCAL_STATIC_JAVA_LIBRARIES := ims-ext-common
 
 LOCAL_SRC_FILES := $(call all-java-files-under, src) $(call all-proto-files-under, proto)
+LOCAL_SRC_FILES += \
+       src/org/codeaurora/btmultisim/IBluetoothDsdaService.aidl
+
 LOCAL_RESOURCE_DIR := $(LOCAL_PATH)/res
 
 LOCAL_PROTOC_OPTIMIZE_TYPE := nano

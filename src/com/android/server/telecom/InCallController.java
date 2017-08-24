@@ -194,7 +194,8 @@ public final class InCallController extends CallsManagerListenerBase {
             Log.i(this, "Attempting to bind to InCall %s, with %s", mInCallServiceInfo, intent);
             mIsConnected = true;
             if (!mContext.bindServiceAsUser(intent, mServiceConnection,
-                        Context.BIND_AUTO_CREATE | Context.BIND_FOREGROUND_SERVICE,
+                        Context.BIND_AUTO_CREATE | Context.BIND_FOREGROUND_SERVICE |
+                        Context.BIND_ABOVE_CLIENT,
                         UserHandle.CURRENT)) {
                 Log.w(this, "Failed to connect.");
                 mIsConnected = false;
@@ -1122,6 +1123,7 @@ public final class InCallController extends CallsManagerListenerBase {
         }
         Log.i(this, "%s calls sent to InCallService.", numCallsSent);
         Trace.endSection();
+        mCallsManager.setDsdaAdapter();
         return true;
     }
 

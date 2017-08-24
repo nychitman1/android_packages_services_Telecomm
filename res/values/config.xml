@@ -46,4 +46,8 @@
          different source (connection service) from the existing ringing call when reaching
          maximum ringing calls. -->
     <bool name="silence_incoming_when_different_service_and_maximum_ringing">false</bool>
+
+    <!-- DTMF key to be used for LCH hold tone -->
+    <string name="lch_dtmf_key" translatable="false">D</string>
+
 </resources>
